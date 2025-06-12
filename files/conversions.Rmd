@@ -1,0 +1,102 @@
+---
+title: "Conversions"
+author: "Ricky Truong"
+date: "June 2025"
+
+fontsize: 11pt
+geometry: margin=1in
+
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+---
+
+# Background
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+# Delete everything in environment
+rm(list = ls())
+
+# Load libraries
+library(tidyverse)
+library(readxl)
+library(readr)
+```
+
+### Load data
+
+```{r, message = FALSE, warning = FALSE}
+# Load EIA Total CO2 Emission, 1970-2022 (in million metric tons)
+co2_million_tons <- read_excel("CO2.xlsx")
+
+# Load EPA Total PM2.5 Emission, 1990-2024 (in kilotons)
+pm2.5_kilotons <- read.csv("national_tier1_caps_21feb2025.xlsx - PM25Primary.csv")
+```
+
+# Data wrangling
+
+### Wrangle CO2 data
+
+```{r, message = FALSE, warning = FALSE}
+# Delete (unnecessary) last four columns
+co2_million_tons <- subset(co2_million_tons, select = -c(...55 : ...58))
+
+# Rename columns of data set
+years <- seq(1970, 2022)
+cols <- append(years, "variable", 0)
+names(co2_million_tons) <- cols
+
+# Convert data to be in long/tidy format with correct values
+co2_million_tons <- co2_million_tons %>%
+  filter(variable == "Total of states") %>%
+  pivot_longer(cols = -variable,
+               names_to = "Year",
+               values_to = "CO2") %>%
+  mutate(Year = as.integer(Year),
+         CO2 = as.numeric(gsub(",", "", CO2))) %>%
+  select(Year, CO2)
+```
+
+### Wrangle PM2.5 data
+
+```{r}
+# Rename columns of data set
+years <- seq(1990, 2024)
+cols <- append(years, "variable", 0)
+names(pm2.5_kilotons) <- cols
+
+# Convert data to be in long/tidy format with correct values
+pm2.5_kilotons <- pm2.5_kilotons %>%
+  filter(variable == "Total") %>%
+  pivot_longer(cols = -variable,
+               names_to = "Year",
+               values_to = "PM2.5") %>%
+  mutate(Year = as.integer(Year),
+         PM2.5 = as.numeric(gsub(",", "", PM2.5))) %>%
+  select(Year, PM2.5)
+```
+
+# Conversions
+
+### Convert PM2.5 data to million metric tons^[1 kiloton = 0.001 million metric tons (since 1 kiloton = 1,000 metric tons)]
+
+```{r}
+pm2.5_million_tons <- pm2.5_kilotons %>% 
+  mutate(PM2.5 = 0.001 * PM2.5)
+
+head(co2_million_tons)
+head(pm2.5_million_tons)
+```
+
+### Convert CO2 data to kilotons^[1 million metric ton = 1,000 kilotons (since 1 million metric tons = 1,000,000 metric tons)]
+
+```{r}
+co2_kilotons <- co2_million_tons %>% 
+  mutate(CO2 = 1000 * CO2)
+
+head(co2_kilotons)
+head(pm2.5_kilotons)
+```

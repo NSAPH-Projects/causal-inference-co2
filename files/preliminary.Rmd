@@ -1,0 +1,325 @@
+---
+title: "Preliminary Assignment"
+author: "Ricky Truong"
+date: "March 2025"
+
+fontsize: 11pt
+geometry: margin=1in
+
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+---
+
+# Libraries and data frames
+
+```{r}
+# Clear environment
+# rm(list = ls())
+
+# Load CausalArima
+# install.packages("devtools")
+# install.packages("tidybayes")
+# devtools::install_github("FMenchetti/CausalArima")
+library(CausalArima)
+
+# Load libraries
+library(tidyverse)
+library(readxl)
+library(readr)
+```
+
+```{r}
+# Load data frames
+GDP <- read_delim("GDP.csv", delim = ";", 
+                  escape_double = FALSE, trim_ws = TRUE)
+CO2 <- read_excel("CO2.xlsx")
+```
+
+# Part 0: Wrangle data
+
+```{r}
+# Delete unnecessary rows in CO2 data frame
+CO2 <- CO2[-c(1, 2, 3, 4, 57),]
+
+# Define values for CO2
+years <- seq(1970, 2022)
+newnames <- paste0(years, "_CO2")
+newnames <- append(newnames, "state", 0)
+newnames <- append(newnames, "1970_2022_CO2_percent_change", 54)
+newnames <- append(newnames, "1970_2022_CO2_absolute_change", 55)
+newnames <- append(newnames, "2021_2022_CO2_percent_change", 56)
+newnames <- append(newnames, "2021_2022_CO2_absolute_change", 57)
+
+# Rename columns of CO2 using names()
+names(CO2) <- newnames
+
+# Define values for GDP
+years <- seq(1997, 2023)
+newnames <- paste0(years, "_GDP")
+newnames <- append(newnames, "geo_name", 0)
+
+# Rename columns of GDP using names()
+names(GDP) <- newnames
+```
+
+# Part 1: Combine data frames
+
+```{r}
+# Combine data frames via inner_join()
+states_inner <- inner_join(CO2, GDP, join_by("state" == "geo_name"))
+
+# Combine data frames via full_join()
+states_full <- full_join(CO2, GDP, join_by("state" == "geo_name"))
+
+# Combine data frames via left_join(), with CO2 as the left-hand data frame
+states_left <- left_join(CO2, GDP, join_by("state" == "geo_name"))
+```
+
+# Part 1 Alternative: Make our own data frame in Tidy format
+
+# I want a Tidy data set where the rows are years, there's a column for year, 
+# a column for CO2_{state}, and a column for GDP_{state}
+
+# For now, I will create a data set, new, with only totals and years 1997-2022
+
+```{r}
+# Tranpose CO2
+CO2_alt <- CO2 %>%
+  t()
+
+# Delete unnecessary rows in CO2 (so that only years 1997-2022 are included)
+CO2_alt <- CO2_alt[-c(seq(1, 28), seq(55, 58)),]
+
+# Store total CO2 of states as vector of doubles
+total_CO2 <- as.double(CO2_alt[,52])
+
+# Tranpose GDP
+GDP_alt <- GDP %>%
+  t()
+
+# Delete unnecessary rows in GDP (so that only years 1997-2022 are included)
+GDP_alt <- GDP_alt[-c(1, 28),]
+
+# Store total GDP of states as vector of doubles
+total_GDP <- as.double(GDP_alt[,1])
+
+# Create a new data frame manually
+new <- data.frame("year" = seq(1997, 2022),
+                  "total_CO2" = total_CO2,
+                  "total_GDP" = total_GDP)
+
+# Rename indices
+rownames(new) <- NULL
+```
+
+# Part 1.5 Alternative: Visualize data
+
+```{r}
+# Graph for CO2
+ggplot(data = new, mapping = aes(x = year,
+                                 y = total_CO2)) +
+  geom_line(color = "blue") + 
+  geom_vline(xintercept = 2006, linetype = "dashed", color = "red") + 
+  labs(title = "Time Series of Total CO2 in the U.S.",
+       x = "Year",
+       y = "CO2 Emissions")
+
+# Graph for GDP
+ggplot(data = new, mapping = aes(x = year,
+                                 y = total_GDP)) +
+  geom_line(color = "blue") + 
+  geom_vline(xintercept = 2006, linetype = "dashed", color = "red") + 
+  labs(title = "Time Series of Total GDP in the U.S.",
+       x = "Year",
+       y = "GDP")
+```
+
+# Part 1.75 Alternative: Wrangle data
+
+```{r}
+# Create a vector of years in class Date
+# For consistency, we'll use the first day of each year (e.g., 2006-01-01)
+years_dates <- paste0(seq(1997, 2022), "-01-01")
+```
+
+# Part 2: Use CausalArima (WITHOUT regressor)
+
+# Template code from https://github.com/RobsonTigre/CausalTimeSeries/blob/main/1%20-%20CausalImpact%20and%20CausalArima.R
+# and https://github.com/FMenchetti/CausalArima?tab=readme-ov-file
+
+```{r}
+# EN-US: Define the intervention timepoint (day when the intervention occurs)
+# Intervention is 2006, which is 9 years (~3285 days) from start of 1997
+intervention_time <- 3285
+
+# EN-US: Create a time series object for y with YEARLY seasonality
+CO2_ts <- ts(new$total_CO2, frequency = 1)
+
+# EN-US: Define pre-intervention and post-intervention indices
+# Pre-Period: Days 1 to 3285 (before the intervention).
+pre_period <- 1:(intervention_time - 1) 
+# Post-Period: Days 3285 to 6205 (after the intervention).
+post_period <- intervention_time:length(CO2_ts) 
+
+# EN-US: Set up the parameters for CausalArima's int.date (the intervention date) 
+# and dates (the full date sequence) arguments
+intervention_date <- as.Date("2006-01-01")
+all_dates <- as.Date(years_dates)
+
+# EN-US: Fit the CausalArima model for causal effect estimation
+ce <- CausalArima(y = ts(new$total_CO2, frequency = 1),
+                  dates = all_dates, int.date = intervention_date,
+                   nboot = 1000)
+
+# EN-US: Plot the impact
+forecasted <- plot(ce, type = "forecast")
+print(forecasted)
+impact_p <-plot(ce, type = "impact")
+grid.arrange(impact_p$plot, impact_p$cumulative_plot)
+
+# EN-US: Display the normalized impact
+summary_model <- impact(ce)
+summary_model$arima
+summary_model$impact_norm
+```
+
+# Part 3: Use CausalArima (WITH regressor)
+
+# Template code from https://github.com/RobsonTigre/CausalTimeSeries/blob/main/1%20-%20CausalImpact%20and%20CausalArima.R
+# and https://github.com/FMenchetti/CausalArima?tab=readme-ov-file
+
+```{r}
+# EN-US: Define the intervention timepoint (day when the intervention occurs)
+# Intervention is 2006, which is 9 years (~3285 days) from start of 1997
+intervention_time <- 3285
+
+# EN-US: Create a time series object for y with YEARLY seasonality
+CO2_ts <- ts(new$total_CO2, frequency = 1)
+
+# EN-US: Define pre-intervention and post-intervention indices
+# Pre-Period: Days 1 to 3285 (before the intervention).
+pre_period <- 1:(intervention_time - 1) 
+# Post-Period: Days 3285 to 6205 (after the intervention).
+post_period <- intervention_time:length(CO2_ts) 
+
+# EN-US: Set up the parameters for CausalArima's int.date (the intervention date) 
+# and dates (the full date sequence) arguments
+intervention_date <- as.Date("2006-01-01")
+all_dates <- as.Date(years_dates)
+
+# EN-US: Fit the CausalArima model for causal effect estimation
+ce <- CausalArima(y = ts(new$total_CO2, frequency = 1),
+                  dates = all_dates, int.date = intervention_date,
+                  xreg = total_GDP, nboot = 1000)
+
+# EN-US: Plot the impact
+forecasted <- plot(ce, type = "forecast")
+print(forecasted)
+impact_p <-plot(ce, type = "impact")
+grid.arrange(impact_p$plot, impact_p$cumulative_plot)
+
+# EN-US: Display the normalized impact
+summary_model <- impact(ce)
+summary_model$arima
+summary_model$impact_norm
+```
+
+# Part 4: Comment on results
+
+I'm very happy with the result of this project. Though I wasn't very familiar
+with times series or causal inference at the start of this (conceptually and
+code-wise), I feel I better understand it now; from what I understand, we 
+try to extrapolate the time series data (before the intervention) into the future 
+to see what "would've been" if there wasn't any intervention, and we compare
+this "counterfactual" to our observed data from after the intervention. Just 
+from that intuition and the graph from Part 2, I'm sure anyone can see there 
+appears to be evidence toward a causal impact from the 2006 revision, both with 
+and without GDP as a regressor (to be honest, I feel I don't fully understand 
+this part and its significance).
+
+I'm also happy because I challenged myself to not use any GenAI, which I feel
+helped me with my coding/problem-solving skills; I instead relied on a lot of 
+helpful resources I found on Google and YouTube. The only GenAI I used
+was ChatGPT near the beginning to install the CausalArima library (this is 
+elaborated further on the email). Not using GenAI was definitely a challenge
+given that the datasets were not in the Tidy format I'm used to, so I had to 
+get a bit creative with some of the data wrangling. Related, for possible
+improvements in the future, I'd love to consider individual states/regions
+rather than the entire U.S. for analysis, which would require the "new" data set
+to contain more information (as outlined in Part 1 Alternative). Also, I'd 
+love to use GenAI to polish the code as I'm sure I wasn't being the most 
+efficient in some of my code.
+
+# Part 5: Use CausalArima (WITHOUT regressor and WITH more years)
+
+```{r}
+### DATA WRANGLING:
+# Tranpose CO2
+CO2_updated <- CO2 %>%
+  t()
+
+# Delete unnecessary rows in CO2
+CO2_updated <- CO2_updated[-c(1, seq(55, 58)),]
+
+# Store total CO2 of states as vector of doubles
+total_CO2 <- as.double(CO2_updated[,52])
+
+# Create a new data frame manually
+new_updated <- data.frame("year" = seq(1970, 2022),
+                          "total_CO2" = total_CO2)
+
+# Rename indices
+rownames(new) <- NULL
+
+### DATA VISUALIZATION:
+# Graph for CO2
+ggplot(data = new_updated, mapping = aes(x = year,
+                                         y = total_CO2)) +
+  geom_line(color = "blue") + 
+  geom_vline(xintercept = 2006, linetype = "dashed", color = "red") + 
+  labs(title = "Time Series of Total CO2 in the U.S.",
+       x = "Year",
+       y = "CO2 Emissions")
+
+### DATA WRANGLING:
+# Create a vector of years in class Date
+# For consistency, we'll use the first day of each year (e.g., 2006-01-01)
+years_dates <- paste0(seq(1970, 2022), "-01-01")
+
+### CAUSALARIMA:
+# EN-US: Define the intervention timepoint (day when the intervention occurs)
+# Intervention is 2006, which is 36 years (~13140 days) from start of 1970
+intervention_time <- 13140
+
+# EN-US: Create a time series object for y with YEARLY seasonality
+CO2_ts <- ts(new_updated$total_CO2, frequency = 1)
+
+# EN-US: Define pre-intervention and post-intervention indices
+# Pre-Period: Days 1 to 13140 (before the intervention).
+pre_period <- 1:(intervention_time - 1) 
+# Post-Period: Days 13140 to 18980 (after the intervention).
+post_period <- intervention_time:length(CO2_ts) 
+
+# EN-US: Set up the parameters for CausalArima's int.date (the intervention date) 
+# and dates (the full date sequence) arguments
+intervention_date <- as.Date("2006-01-01")
+all_dates <- as.Date(years_dates)
+
+# EN-US: Fit the CausalArima model for causal effect estimation
+ce <- CausalArima(y = ts(new_updated$total_CO2, frequency = 1),
+                  dates = all_dates, int.date = intervention_date,
+                   nboot = 1000)
+
+# EN-US: Plot the impact
+forecasted <- plot(ce, type = "forecast")
+print(forecasted)
+impact_p <-plot(ce, type = "impact")
+grid.arrange(impact_p$plot, impact_p$cumulative_plot)
+
+# EN-US: Display the normalized impact
+summary_model <- impact(ce)
+summary_model$arima
+summary_model$impact_norm
+```

@@ -7,6 +7,9 @@ This is the repository for a project estimating the causal effect of the EPA's N
 ## Repository Structure
 
 - `data`: This folder contains the "raw" data (downloaded online, internal to NSAPH, etc.) used in the analysis. If publicly available, the data sets are cited via links in footnotes.
+  - Due to size constraints, the `CMS_DARTE_V2_1735` (on-road CO2 emissions) and `dataverse_files` (PM2.5 concentrations) data sets are not included in this repository.
+  - For `CMS_DARTE_V2_1735`, see [source](https://daac.ornl.gov/CMS/guides/CMS_DARTE_V2.html) or [Google Drive](https://drive.google.com/drive/folders/1JzMBRfZViuME22leN3n780HsCKTs6-L1?usp=drive_link).
+  - For `dataverse_files`, see [source](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/4GDRB1) or [Google Drive](https://drive.google.com/drive/folders/1RrmPcP52OdRvOs7PLh0vGutQOU0E-TNL?usp=drive_link).
 - `files`: This folder contains the files (.Rmd and .pdf) with the code and documentation.
   - `aggregation`: This file aggregates data on PM2.5 concentration in the U.S. from the ZCTA level to the census block group level to join with the NASA data.
   - `final_county`: This file performs causal inference at the county level. It first cleans the NASA data (outputting `co2_county.csv`) and then runs `CausalArima` on one specified county. Finally, with `co2_county_causal_arima.csv` from `run_causal_arima.R`, it plots the results of significant counties on a map of the U.S.

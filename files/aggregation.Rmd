@@ -1,0 +1,254 @@
+---
+title: "Aggregation"
+author: "Ricky Truong"
+date: "August 2025"
+
+fontsize: 11pt
+geometry: margin=1in
+
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+---
+
+# Background
+
+### Delete everything in environment
+
+# ```{r, message = FALSE, warning = FALSE}
+# rm(list = ls())
+# ```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(sf)
+library(tidyverse)
+```
+
+### Load data for crosswalk (between block group and ZCTA)
+
+```{r}
+crosswalk <- read_parquet("nhgis__block2zcta__2010.parquet")
+```
+
+### Load data for PM2.5 (at ZCTA level)
+
+```{r}
+# Create path to the .parquet files
+pm25_path <- "dataverse_files"
+
+# List all .parquet files for years 2000–2020
+file_list <- list.files(path = pm25_path,
+                        pattern = "^pm25__ushap__zcta_yearly__20\\d{2}\\.parquet$",
+                        full.names = TRUE)
+
+# Read and combine all files into data frame
+pm25 <- file_list %>%
+  lapply(read_parquet) %>%
+  bind_rows()
+```
+
+### Load data for CO2 (at census-block-group level)
+
+```{r}
+# Create path to the .gdb directory
+co2_path <- "CMS_DARTE_V2_1735/data/DARTE_v2.gdb"
+
+# List the available layers (feature classes) inside the .gdb
+st_layers(dsn = co2_path)
+
+# Load the specific layer
+co2 <- st_read(dsn = co2_path, layer = "DARTE_v2_blockgroup_kgco2_1980_2017")
+```
+
+# Data wrangling for `crosswalk`
+
+### Add separate variables for `block` and `block_group`
+
+```{r}
+crosswalk <- crosswalk %>%
+  rename(fips_code = block) %>%
+  mutate(block_group = substring(fips_code, 12, 12),
+         block = substring(fips_code, 13, 15))
+```
+
+### Calculate weights
+
+```{r}
+crosswalk <- crosswalk %>%
+  group_by(state, county, tract, block_group) %>%
+  mutate(block_group_population = sum(total_pop),
+         block_fraction = total_pop / block_group_population)
+```
+
+### Add separate variable for `fips_code_no_block` (to combine with `co2`)
+
+```{r}
+crosswalk <- crosswalk %>%
+  mutate(fips_code_no_block = substring(fips_code, 1, 12))
+```
+
+# Data wrangling for `co2`
+
+### Convert `co2` to tidy format
+
+```{r}
+co2 <- co2 %>%
+  pivot_longer(cols = starts_with("kgco2_"),
+               names_to = "year",
+               names_prefix = "kgco2_",
+               values_to = "value") %>%
+  mutate(year = as.integer(year))
+```
+
+# Previewing
+
+### Preview `crosswalk`
+
+```{r}
+head(crosswalk)
+```
+
+### Preview `pm25`
+
+```{r}
+head(pm25)
+```
+
+### Preview `co2`
+
+```{r}
+head(co2)
+```
+
+# Apply `crosswalk` 
+
+### Search `crosswalk` for value in `pm25` as a sanity check
+
+```{r}
+crosswalk %>%
+  filter(zcta == "01040")
+```
+
+### Search `crosswalk` for value in `co2` as a sanity check
+
+```{r}
+crosswalk %>%
+  filter(fips_code_no_block == "010810416001")
+```
+
+### Combine `crosswalk` and `co2`
+
+```{r}
+# Select for only necessary variables to avoid large data sets
+crosswalk <- crosswalk %>%
+  ungroup() %>%
+  select(fips_code, zcta, block_fraction, fips_code_no_block)
+
+co2 <- co2 %>%
+  ungroup() %>%
+  st_drop_geometry() %>%
+  as.data.frame() %>%
+  select(GEOID, year, value)
+
+# Combine via inner_join()
+df <- inner_join(crosswalk, co2, join_by("fips_code_no_block" == "GEOID"))
+
+# Wrangle df
+df <- df %>%
+  rename(block_group_value = value) %>%
+  mutate(block_value = block_group_value * block_fraction) %>%
+  select(-c(fips_code_no_block, block_fraction))
+
+# Preview df
+head(df, 100)
+```
+
+### Double check output (again, as a sanity check)
+
+```{r}
+# For block group of 010010201001000 in 1980, the value should be 2514107
+co2 %>%
+  filter(GEOID == "010010201001", year == 1980)
+```
+
+# Applying `pm25`
+
+### Combine `pm25` and `df`
+
+```{r}
+# Rename block_value to CO2 and aggregate from block-year to ZCTA-year
+df_zcta_year <- df %>%
+  rename(CO2 = block_value) %>%
+  group_by(zcta, year) %>%
+  summarise(CO2 = sum(CO2, na.rm = TRUE), .groups = "drop")
+
+# Combine via inner_join()
+aggregated <- inner_join(pm25, df_zcta_year, join_by("zcta", "year"))
+```
+
+# Double check extreme values
+
+### Preview `aggregated`
+
+```{r}
+# Preview aggregated with no organization
+head(aggregated, 100)
+
+# Preview aggregated with organization
+aggregated %>%
+  arrange(zcta) %>%
+  select(year, zcta, PM25, CO2) %>%
+  head(100)
+
+# Filter for rows with missing values for PM25
+missing_pm25 <- aggregated %>%
+  filter(is.na(PM25))
+
+missing_pm25
+
+# Filter for rows with missing values for CO2
+missing_co2 <- aggregated %>%
+  filter(is.na(CO2))
+
+missing_co2
+
+# Filter for rows with zero for PM25
+zero_pm25 <- aggregated %>%
+  filter(PM25 == 0)
+
+zero_pm25
+
+# Filter for rows with zero for CO2
+zero_co2 <- aggregated %>%
+  filter(CO2 == 0)
+
+zero_co2
+```
+
+### Search `pm25` for missing value in `aggregated` as a sanity check
+
+```{r}
+# For ZCTA of 00601 in 2000, the value should be NA
+pm25 %>%
+  filter(zcta == "00601", year == 2000)
+```
+
+### Search `df` for zero value in `aggregated` as a sanity check
+
+```{r}
+# For ZCTA of 00601 in 2000, the values should be 0
+df %>%
+  filter(zcta == "00601", year == 2000)
+```
+
+# Exporting files
+
+### Export `aggregated`
+
+```{r}
+write.csv(aggregated, "~/aggregated.csv", row.names = FALSE)
+```

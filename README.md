@@ -1,4 +1,4 @@
-# Climate Co-Benefits of U.S. Air Quality Regulations on CO2 Emissions
+# Climate Benefits of Air Quality Regulation
 
 ## Overview
 

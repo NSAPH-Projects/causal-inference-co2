@@ -15,5 +15,6 @@ This is the repository for a project estimating the causal effect of the EPA's N
   - `final_county`: This file performs causal inference at the county level. It first cleans the NASA data (outputting `co2_county.csv`) and then runs `CausalArima` on one specified county. Finally, with `co2_county_causal_arima.csv` from `run_causal_arima.R`, it plots the results of significant counties on a map of the U.S.
   - `final_national`: This file performs causal inference at the national level. It first cleans the EIA data along with data on multiple potential covariates (outputting `national.csv`) and then runs `CausalArima` using U.S. trade/GDP ratio, real GDP on a log scale, and urban population ratio as covariates.
   - `run_causal_arima`: This file runs `CausalArima` iteratively through every available county in the contiguous U.S. (with `co2_county.csv` from `final_county.Rmd`) and outputs `co2_county_causal_arima.csv`.
+  - `draft`: This file combines all relevant steps from the files above into one document while adding regression analysis via ordinary least squares (OLS) and weighted least squares (WLS).
 - `plots`: This folder contains the important visualizations generated in the files.
 - `results`: This folder contains the important data sets generated, processed, and used in the files.

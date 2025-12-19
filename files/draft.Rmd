@@ -1,0 +1,1180 @@
+---
+title: "Draft"
+author: "Ricky Truong"
+date: "December 2025"
+
+fontsize: 11pt
+geometry: margin=1in
+
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+---
+
+# Background
+
+### Delete everything in environment
+
+```{r, message = FALSE, warning = FALSE}
+rm(list = ls())
+```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(broom)
+library(CausalArima)
+library(colorspace)
+library(glue)
+library(mgcv)
+library(moderndive)
+library(scales)
+library(scatterplot3d)
+library(sf)
+library(tidyverse)
+library(tigris)
+```
+
+### Load data for county shapefile (from `library(tigris)`)
+
+```{r}
+# Load county shapefile (includes FIPS codes and geometry)
+counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>%
+  mutate(fips = paste0(STATEFP, COUNTYFP))
+
+# Filter for contiguous U.S.
+contiguous_fips <- setdiff(sprintf("%02d", 1:56),
+                           c("02", "15", "60", "66", "69", "72", "78"))
+counties_sf <- counties_sf %>%
+  filter(STATEFP %in% contiguous_fips)
+```
+
+### Load data for crosswalk (between ZCTA and county)
+
+```{r}
+xwalk22 <- read_parquet("us_xwalks__census__zcta2county_yearly__2022.parquet")
+xwalk21 <- read_parquet("us_xwalks__census__zcta2county_yearly__2021.parquet")
+xwalk20 <- read_parquet("us_xwalks__census__zcta2county_yearly__2020.parquet")
+xwalk19 <- read_parquet("us_xwalks__census__zcta2county_yearly__2019.parquet")
+xwalk18 <- read_parquet("us_xwalks__census__zcta2county_yearly__2018.parquet")
+xwalk17 <- read_parquet("us_xwalks__census__zcta2county_yearly__2017.parquet")
+xwalk16 <- read_parquet("us_xwalks__census__zcta2county_yearly__2016.parquet")
+xwalk15 <- read_parquet("us_xwalks__census__zcta2county_yearly__2015.parquet")
+xwalk14 <- read_parquet("us_xwalks__census__zcta2county_yearly__2014.parquet")
+xwalk13 <- read_parquet("us_xwalks__census__zcta2county_yearly__2013.parquet")
+xwalk12 <- read_parquet("us_xwalks__census__zcta2county_yearly__2012.parquet")
+xwalk11 <- read_parquet("us_xwalks__census__zcta2county_yearly__2011.parquet")
+xwalk10 <- read_parquet("us_xwalks__census__zcta2county_yearly__2010.parquet")
+xwalk09 <- read_parquet("us_xwalks__census__zcta2county_yearly__2009.parquet")
+xwalk08 <- read_parquet("us_xwalks__census__zcta2county_yearly__2008.parquet")
+xwalk07 <- read_parquet("us_xwalks__census__zcta2county_yearly__2007.parquet")
+xwalk06 <- read_parquet("us_xwalks__census__zcta2county_yearly__2006.parquet")
+xwalk05 <- read_parquet("us_xwalks__census__zcta2county_yearly__2005.parquet")
+xwalk04 <- read_parquet("us_xwalks__census__zcta2county_yearly__2004.parquet")
+xwalk03 <- read_parquet("us_xwalks__census__zcta2county_yearly__2003.parquet")
+xwalk02 <- read_parquet("us_xwalks__census__zcta2county_yearly__2002.parquet")
+xwalk01 <- read_parquet("us_xwalks__census__zcta2county_yearly__2001.parquet")
+xwalk00 <- read_parquet("us_xwalks__census__zcta2county_yearly__2000.parquet")
+```
+
+### Load data for total CO2 emissions (at census block group level, in kilograms)
+
+```{r}
+# Create path to the .gdb directory
+co2_path <- "CMS_DARTE_V2_1735/data/DARTE_v2.gdb"
+
+# List the available layers (feature classes) inside the .gdb
+st_layers(dsn = co2_path)
+
+# Load the specific layer
+co2_cbg <- st_read(dsn = co2_path, layer = "DARTE_v2_blockgroup_kgco2_1980_2017")
+```
+
+### Load data for average PM2.5 concentration (at ZCTA level, in micrograms per cubic meter)
+
+```{r}
+# Create path to the .parquet files
+pm25_path <- "dataverse_files"
+
+# List all .parquet files for years 2000–2020
+file_list <- list.files(path = pm25_path,
+                        pattern = "^pm25__ushap__zcta_yearly__20\\d{2}\\.parquet$",
+                        full.names = TRUE)
+
+# Read and combine all files into data frame
+pm25_zcta <- file_list %>%
+  lapply(read_parquet) %>%
+  bind_rows()
+```
+
+# Data wrangling for `co2_cbg`
+
+### Convert `co2_cbg` to tidy format
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  pivot_longer(cols = starts_with("kgco2_"),
+               names_to = "year",
+               names_prefix = "kgco2_",
+               values_to = "value") %>%
+  mutate(year = as.integer(year))
+```
+
+<!-- ### Convert `co2_cbg` from kilograms to million metric tons (1 mmt = 1e9 kg) -->
+
+<!-- ### Keep in kilograms moving forward -->
+
+<!-- ```{r} -->
+<!-- co2_cbg <- co2_cbg %>% -->
+<!--   mutate(value = value / 1e9) -->
+<!-- ``` -->
+
+### Select for variables to avoid large data set
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  ungroup() %>%
+  st_drop_geometry() %>%
+  as.data.frame() %>%
+  rename(geoid = GEOID) %>%
+  select(geoid, year, value)
+```
+
+# Data wrangling for `xwalk`
+
+### Combine everything into one crosswalk
+
+```{r}
+years <- 2000:2022
+file_paths <- paste0("us_xwalks__census__zcta2county_yearly__", years, ".parquet")
+xwalk_list <- map(file_paths, read_parquet)
+xwalk <- bind_rows(xwalk_list)
+```
+
+# Aggregation for `pm25_zcta`
+
+### Join `xwalk` and `pm25_zcta`
+
+```{r}
+pm25_county <- inner_join(xwalk, pm25_zcta, by = c("zcta", "year"))
+```
+
+### Aggregate from ZCTA level to county level
+
+```{r}
+pm25_county <- pm25_county %>% 
+  group_by(year, county) %>% 
+  mutate(weight = (arealand_pct / 100)) %>% 
+  mutate(weight =  weight / sum(weight, na.rm = TRUE)) %>% 
+  summarize(pm25 = sum(PM25 * weight, na.rm = TRUE),
+            .groups = "drop")
+```
+
+# Aggregation for `co2_cbg`
+
+### Create variable for county FIPS code
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  mutate(county = substring(geoid, 1, 5))
+```
+
+### Aggregate from census block group level to county level
+
+```{r}
+co2_county <- co2_cbg %>%
+  group_by(year, county) %>% 
+  summarize(co2 = sum(value, na.rm = TRUE),
+            .groups = "drop")
+```
+
+# Finalizing files
+
+### Filter for contiguous U.S.
+
+```{r}
+pm25_county <- pm25_county %>% 
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+
+co2_county <- co2_county %>% 
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+```
+
+### Create `df` by joining `pm25_county` and `co2_county`
+
+```{r}
+df <- inner_join(pm25_county, co2_county, by = c("county", "year")) %>%
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+```
+
+### Filter for years less than or equal to 2010 (to avoid confounding)
+
+```{r}
+df <- df %>%
+  filter(year <= 2010)
+```
+
+# Data visualization
+
+### Aggregate CO2
+
+```{r}
+# Aggregate total CO2 for all counties by year
+co2_total_year <- co2_county %>%
+  group_by(year) %>%
+  summarize(total_co2 = sum(co2, na.rm = TRUE))
+
+# Check the result
+head(co2_total_year)
+```
+
+### Plot aggregate CO2
+
+```{r}
+# Create graph of CO2 data
+co2_plot <- co2_total_year %>%
+  ggplot() +
+  geom_line(aes(x = year, y = total_co2), linewidth = 2) +
+  geom_vline(aes(xintercept = 2005, linetype = "2005: Nonattainment Designation from NAAQS"), 
+             color = "red",
+             linewidth = 2.5) +
+  labs(title = "Aggregated On-Road CO2 Emissions in the Contiguous U.S.",
+       x = "Year",
+       y = "CO2 (kilograms)",
+       fill = "",
+       linetype = "") +
+  scale_linetype_manual(values = c("2005: Nonattainment Designation from NAAQS" = "dotted")) +
+  theme_minimal() +
+  # theme(legend.position = "bottom",
+  #       plot.title = element_text(size = 44),
+  #       axis.text = element_text(size = 32),
+  #       axis.title = element_text(size = 40),
+  #       legend.text = element_text(size = 36))
+  theme(legend.position = "bottom")
+
+# Plot and save graph
+co2_plot
+ggsave("co2_plot.png",
+       plot = co2_plot,
+       width = 20, height = 12, dpi = 300,
+       bg = "white")
+```
+
+# Individual county-level analysis
+
+### Run CausalArima on specified county to estimate statistics 
+
+```{r}
+# FIPS "01053" is in Alabama (which had minimal legislation besides NAAQS)
+
+# Specify FIPS code for individual county
+my_fips <- "01053"
+
+# Get county_df for specified FIPS
+county_df <- co2_county %>%
+  filter(county == my_fips)
+
+# Filter for 2010
+county_df <- county_df %>%
+  filter(year <= 2010)
+
+# Define intervention time point
+intervention_date <- as.Date("2005-01-01")
+
+# Create vector for dates
+all_dates <- as.Date(paste0(county_df$year, "-01-01"))
+
+# Create time series for outcome with yearly seasonality
+y_ts <- ts(county_df$co2 * 100000, frequency = 1)
+
+# Run CausalArima()
+ce <- CausalArima(y = y_ts,
+                  dates = all_dates,
+                  int.date = intervention_date,
+                  nboot = 1000)
+
+# calculate (observed - forecast) / forecast
+# (y1 - y0) / y0
+# reduced co2 with respect what would have been 
+
+# calculate this year by year 
+
+# extract forecasted series after running model with 2010
+# Create list to store relative effects 
+
+
+# Get impact as list
+imp <- impact(ce)
+
+# Extract statistics via impact_norm
+norm_effect <- imp$impact_norm$sum
+cum_effect <- norm_effect$estimate
+avg_effect <- imp$impact_norm$average$estimate
+sd_norm <- norm_effect$sd
+ci_lower_norm <- cum_effect - 1.96 * sd_norm
+ci_upper_norm <- cum_effect + 1.96 * sd_norm
+
+# Extract statistics via impact_boot
+boot_list <- imp$impact_boot
+boot_effect <- boot_list$effect_cum[3, ]
+rel_cum_effect <- imp$impact_boot$effect_cum$estimates[4]
+p_value_boot_one_sided <- as.numeric(boot_list$p_values["p"])
+
+?CausalArima
+
+# Store data as tibble
+object <- tibble(cum_effect = cum_effect,
+                 rel_cum_effect = rel_cum_effect,
+                 avg_effect = avg_effect,
+                 sd_norm = sd_norm,
+                 ci_lower_norm = ci_lower_norm,
+                 ci_upper_norm = ci_upper_norm,
+                 p_value_norm = norm_effect$p_value_bidirectional,
+                 sd_boot = boot_effect$sd,
+                 ci_lower_boot = boot_effect$inf,
+                 ci_upper_boot = boot_effect$sup,
+                 p_value_boot = min(1, 2 * p_value_boot_one_sided))
+object
+
+ce$dates
+```
+
+# County-level analysis across counties
+
+### Run CausalArima on every available county to estimate statistics
+
+```{r, cache = TRUE}
+# Initialize list to store results
+results_list <- list()
+
+# Define intervention time point
+intervention_date <- as.Date("2005-01-01")
+
+# Get unique counties (to avoid repeating counties over years)
+fips_vec <- unique(df$county)
+
+# Loop through each county
+for (i in seq_along(fips_vec)) {
+  my_fips <- fips_vec[i]
+
+  # Get county_df for specified FIPS
+  county_df <- co2_county %>%
+    filter(county == my_fips)
+
+  # Skip if no data
+  if (nrow(county_df) == 0) {
+    warning(glue("No data for FIPS {my_fips}, skipping..."))
+    next
+  }
+
+  # Create vector for dates
+  all_dates <- as.Date(paste0(county_df$year, "-01-01"))
+
+  # Create time series for outcome with yearly seasonality
+  y_ts <- ts(county_df$co2, frequency = 1)
+
+  # Use tryCatch to avoid full script crashing
+  tryCatch({
+    # Run CausalArima()
+    ce <- CausalArima(y = y_ts,
+                      dates = all_dates,
+                      int.date = intervention_date,
+                      nboot = 1000)
+
+    # Get impact as list
+    imp <- impact(ce)
+
+    # Extract statistics via impact_norm
+    norm_effect <- imp$impact_norm$sum
+    cum_effect <- norm_effect$estimate
+    avg_effect <- imp$impact_norm$average$estimate
+    sd_norm <- norm_effect$sd
+    ci_lower_norm <- cum_effect - 1.96 * sd_norm
+    ci_upper_norm <- cum_effect + 1.96 * sd_norm
+
+    # Extract statistics via impact_boot
+    boot_list <- imp$impact_boot
+    boot_effect <- boot_list$effect_cum[3, ]
+    rel_cum_effect <- imp$impact_boot$effect_cum$estimates[4]
+    p_value_boot_one_sided <- as.numeric(boot_list$p_values["p"])
+
+    # Store data as tibble
+    result_row <- tibble(fips = my_fips,
+                         avg_effect = avg_effect,
+                         cum_effect = cum_effect,
+                         rel_cum_effect = rel_cum_effect,
+                         sd_norm = sd_norm,
+                         ci_lower_norm = ci_lower_norm,
+                         ci_upper_norm = ci_upper_norm,
+                         p_value_norm = norm_effect$p_value_bidirectional,
+                         sd_boot = boot_effect$sd,
+                         ci_lower_boot = boot_effect$inf,
+                         ci_upper_boot = boot_effect$sup,
+                         p_value_boot = min(1, 2 * p_value_boot_one_sided))
+
+    # Add to current results
+    results_list[[length(results_list) + 1]] <- result_row
+
+    # Print progress
+    message(glue("{i}/{length(fips_vec)}: FIPS {my_fips} processed."))
+
+    # Save checkpoint every 50 iterations
+    if (i %% 50 == 0 || i == length(fips_vec)) {
+      checkpoint_df <- bind_rows(results_list)
+      write_csv(checkpoint_df, "checkpoint_results.csv")
+      message(glue("Checkpoint saved at iteration {i}"))
+    }
+
+  }, error = function(e) {
+    warning(glue("Error for FIPS {my_fips}: {e$message}"))
+  })
+}
+
+# Save and export results
+df_causal_arima <- bind_rows(results_list)
+message("All counties processed. Final results saved.")
+```
+
+### Export `df_causal_arima`
+
+```{r}
+write_csv(df_causal_arima, "~/df_causal_arima.csv")
+```
+
+### Read `df_causal_arima`
+
+```{r}
+df_causal_arima <- read_csv("df_causal_arima.csv")
+```
+
+### Create `df_map` by adding polygons to `df_causal_arima`
+
+```{r}
+# Join shapefile with df_causal_arima
+df_map <- counties_sf %>%
+ inner_join(df_causal_arima, by = "fips")
+```
+
+### Filter for significant counties (`p_value_boot` < 0.05)
+
+```{r}
+df_map_sig <- df_map %>% 
+  filter(p_value_boot < 0.05)
+```
+
+### Plot choropleth map of U.S. with cumulative effect at each county, sequential
+
+```{r}
+# Define sequential color palette
+seq_colors <- c("#021B40", "#1F78B4", "#D6ECF5")
+
+# Compute global limits for cum_effect
+global_min <- min(df_map_sig$cum_effect, na.rm = TRUE)
+global_max <- max(df_map_sig$cum_effect, na.rm = TRUE)
+
+# Create graph of cumulative effects
+sig_cum_effect_map <- ggplot(data = df_map_sig) + 
+  geom_sf(aes(fill = cum_effect), color = NA) + 
+  scale_fill_gradientn(colors = seq_colors, 
+                       na.value = "white", 
+                       limits = c(global_min, 0), 
+                       labels = label_number(accuracy = 1), 
+                       guide = guide_colorbar(barwidth = 20, # 50
+                                              barheight = 1, 
+                                              title.position = "top", 
+                                              title.vjust = 1)) + 
+  labs(title = glue("Cumulative Effect by County, 2006-2010: p < 0.05"), 
+       fill = "CO2 (kilograms)") + 
+  theme_minimal() + 
+  # theme(legend.position = "bottom",
+  #       plot.title = element_text(size = 50),
+  #       axis.text = element_text(size = 40),
+  #       legend.title = element_text(size = 50),
+  #       legend.text = element_text(size = 45)) +
+  theme(legend.position = "bottom") +
+  coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE)
+  
+# Plot and save graph
+sig_cum_effect_map
+ggsave("sig_cum_effect_map.png",
+       plot = sig_cum_effect_map,
+       width = 20, height = 18, dpi = 300,
+       bg = "white")
+```
+
+### Plot choropleth map of U.S. with cumulative effect at each county, diverging
+
+```{r}
+# Define diverging color palette
+div_colors <- c("#2166AC", "#4393C3", "#92C5DE", 
+                "#F7F7F7",
+                "#F4A582", "#D6604D", "#B2182B")
+
+# Compute global limits for cum_effect
+global_min <- min(df_map_sig$cum_effect, na.rm = TRUE)
+global_max <- max(df_map_sig$cum_effect, na.rm = TRUE)
+
+# Create graph of cumulative effects
+sig_cum_effect_map <- ggplot(data = df_map_sig) + 
+  geom_sf(aes(fill = cum_effect), color = NA) +
+  scale_fill_gradientn(colors = div_colors,
+                       na.value = "white",
+                       limits = c(global_min, global_max),
+                       values = scales::rescale(c(global_min, 0, global_max)),
+                       labels = label_number(accuracy = 1), 
+                       guide = guide_colorbar(barwidth = 20, # 50
+                                              barheight = 1, 
+                                              title.position = "top", 
+                                              title.vjust = 1)) + 
+  labs(title = glue("Cumulative Effect by County, 2006-2010: p < 0.05"),
+    fill = "CO2 (kilograms)") +
+  theme_minimal() +
+  # theme(legend.position = "bottom",
+  #       plot.title = element_text(size = 50),
+  #       axis.text = element_text(size = 40),
+  #       legend.title = element_text(size = 50),
+  #       legend.text = element_text(size = 45)) +
+  theme(legend.position = "bottom") +
+  coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE)
+
+# Plot and save graph
+sig_cum_effect_map
+ggsave("sig_cum_effect_map.png",
+       plot = sig_cum_effect_map,
+       width = 20, height = 18, dpi = 300,
+       bg = "white")
+```
+
+# Data wrangling
+
+### Transform `df` from county-year level to county level
+
+```{r}
+df <- df %>%
+  select(county, year, pm25, co2) %>%
+  pivot_wider(id_cols = county,
+              names_from = year,
+              values_from = c(pm25, co2),
+              names_glue = "{.value}_{year}",
+              values_fn = list(pm25 = ~first(na.omit(.)),
+                               co2 = ~first(na.omit(.))),
+              values_fill = NA_real_) %>%
+  select(county,
+         all_of(paste0("pm25_", 2000:2010)),
+         all_of(paste0("co2_", 2000:2010)))
+```
+
+### Combine `df` with `df_causal_arima` (already at county level)
+
+```{r}
+df <- df %>%
+  left_join(df_causal_arima %>% select(fips,
+                                       rel_cum_effect,
+                                       avg_effect,
+                                       sd_boot,
+                                       p_value_boot),
+            by = c("county" = "fips"))
+```
+
+### Calculate 2005-2010 change in PM2.5 concentration for each county
+
+```{r}
+df <- df %>%
+  mutate(pm25_change_2005_2010 = pm25_2010 - pm25_2005,
+         pm25_rel_change_2005_2010 = pm25_change_2005_2010 / pm25_2005)
+```
+
+### Add variable for signficance (`p_value_boot` < 0.05)
+
+```{r}
+df <- df %>%
+  mutate(significance = case_when(p_value_boot < 0.05 ~ 1,
+                                  p_value_boot >= 0.05 ~ 0))
+```
+
+# Regression analysis (for counties with `significance` == 1)
+
+### Filter for significant counties (`significance` == 1)
+
+```{r}
+df_sig <- df %>% 
+  filter(significance == 1)
+```
+
+### Plot scatterplots
+
+```{r}
+# Visualize rel_cum_effect and pm25_2005
+plot1 <- ggplot(df_sig, aes(y = rel_cum_effect,
+                            x = pm25_2005)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize rel_cum_effect and pm25_rel_change_2005_2010
+plot2 <- ggplot(df_sig, aes(y = rel_cum_effect,
+                            x = pm25_rel_change_2005_2010)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+```
+
+### Run OLS linear regression with average effect as dependent variable 
+
+```{r}
+# Fit model
+model_ols <- lm(avg_effect ~ pm25_2005 + pm25_rel_change_2005_2010,
+                data = df_sig)
+
+get_regression_table(model_ols)
+```
+
+### Plot scatterplots with OLS model
+
+```{r}
+# Visualize avg_effect and pm25_2005
+plot1 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_2005)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010
+plot2 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_rel_change_2005_2010)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+```
+
+### Run WLS linear regression with average effect as dependent variable 
+
+```{r}
+# Create weight from inverse variance
+df_sig <- df_sig %>% 
+  mutate(weight = 1 / (sd_boot)^2)
+
+# Fit full model
+model_wls <- lm(avg_effect ~ pm25_2005 + pm25_rel_change_2005_2010,
+                weights = weight,
+                data = df_sig)
+get_regression_table(model_wls)
+```
+
+### Plot scatterplots with WLS model
+
+```{r}
+# Predicted values from the WLS model (holding other variable at mean)
+newdata1 <- df_sig %>%
+  mutate(pm25_rel_change_2005_2010 = mean(pm25_rel_change_2005_2010, na.rm = TRUE))
+newdata1$pred <- predict(model_wls, newdata = newdata1)
+
+# Plot with WLS model
+plot1 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_2005,
+                            size = weight)) +
+  # ylim(-2000000000, 1000000000) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_line(data = newdata1, aes(y = pred, x = pm25_2005),
+            color = "blue", linewidth = 1.1) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005–2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+
+# Predicted values from the WLS model (holding other variable at mean)
+newdata2 <- df_sig %>%
+  mutate(pm25_2005 = mean(pm25_2005, na.rm = TRUE))
+newdata2$pred <- predict(model_wls, newdata = newdata2)
+
+# Plot with WLS model
+plot2 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_rel_change_2005_2010,
+                            size = weight)) +
+  geom_point(alpha = 0.25) +
+  # ylim(-2000000000, 1000000000) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_line(data = newdata2, aes(y = pred, x = pm25_rel_change_2005_2010),
+            color = "blue", linewidth = 1.1) +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005–2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+```
+
+### Fit smoothing splines
+
+```{r}
+# Fit model
+gam_model <- gam(avg_effect ~ s(pm25_2005 + pm25_rel_change_2005_2010), weights = weight,
+                 data = df_sig)
+
+# Summarize model
+summary(gam_model)
+tidy(gam_model)
+
+# Visualize model
+plot(gam_model)
+plot(gam_model, pages = 1, shade = TRUE, shade.col = "red",
+     residuals = TRUE, pch = 16, cex = 0.1, scheme = 1, rug = TRUE)
+```
+
+### Plot scatterplots with smoothing splines
+
+```{r}
+# Visualize avg_effect and pm25_2005 with smoothing spline
+plot1 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_2005)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(aes(x = pm25_2005, y = avg_effect, group = 1),
+              method = "gam",
+              formula = y ~ s(x, bs = "cs"),
+              color = "blue",
+              fill = "grey80",
+              linewidth = 1.1,
+              alpha = 0.2,
+              inherit.aes = FALSE) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010 with smoothing spline
+plot2 <- ggplot(df_sig, aes(y = avg_effect,
+                            x = pm25_rel_change_2005_2010)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(aes(x = pm25_rel_change_2005_2010, y = avg_effect, group = 1),
+              method = "gam",
+              formula = y ~ s(x, bs = "cs"),
+              color = "blue",
+              fill = "grey80",
+              linewidth = 1.1,
+              alpha = 0.2,
+              inherit.aes = FALSE) + 
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+
+# Visualize pm25_2005 and pm25_change_2005_2010
+ggplot(df_sig, aes(y = pm25_2005, x = pm25_rel_change_2005_2010)) +
+  geom_point()
+```
+
+# Regression analysis (for all counties)
+
+### Plot scatterplots
+
+```{r}
+# Visualize rel_cum_effect and pm25_2005
+plot1 <- ggplot(df, aes(y = rel_cum_effect,
+                        x = pm25_2005,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize rel_cum_effect and pm25_rel_change_2005_2010
+plot2 <- ggplot(df, aes(y = rel_cum_effect,
+                        x = pm25_rel_change_2005_2010,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+```
+
+### Run OLS linear regression with average effect as dependent variable 
+
+```{r}
+# Fit model
+model_ols <- lm(avg_effect ~ pm25_2005 + pm25_rel_change_2005_2010,
+                data = df)
+
+get_regression_table(model_ols)
+```
+
+### Plot scatterplots with OLS model
+
+```{r}
+# Visualize avg_effect and pm25_2005
+plot1 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_2005,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010
+plot2 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_rel_change_2005_2010,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+```
+
+### Run WLS linear regression with average effect as dependent variable 
+
+```{r}
+# Create weight from inverse variance
+df <- df %>% 
+  mutate(weight = 1 / (sd_boot)^2)
+
+# Fit full model
+model_wls <- lm(avg_effect ~ pm25_2005 + pm25_rel_change_2005_2010,
+                weights = weight,
+                data = df)
+get_regression_table(model_wls)
+```
+
+### Plot scatterplots with WLS model
+
+```{r}
+# Predicted values from the WLS model (holding other variable at mean)
+newdata1 <- df %>%
+  mutate(pm25_rel_change_2005_2010 = mean(pm25_rel_change_2005_2010, na.rm = TRUE))
+newdata1$pred <- predict(model_wls, newdata = newdata1)
+
+# Plot with WLS model
+plot1 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_2005,
+                        color = factor(significance),
+                        size = weight)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_line(data = newdata1, aes(y = pred, x = pm25_2005),
+            color = "blue", linewidth = 1.1) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005–2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+
+# Predicted values from the WLS model (holding other variable at mean)
+newdata2 <- df %>%
+  mutate(pm25_2005 = mean(pm25_2005, na.rm = TRUE))
+newdata2$pred <- predict(model_wls, newdata = newdata2)
+
+# Plot with WLS model
+plot2 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_rel_change_2005_2010,
+                        color = factor(significance),
+                        size = weight)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_line(data = newdata2, aes(y = pred, x = pm25_rel_change_2005_2010),
+            color = "blue", linewidth = 1.1) +
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       size = "Weight (estimated inverse variance)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005–2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+```
+
+### Fit smoothing splines
+
+```{r}
+# Fit model
+gam_model <- gam(avg_effect ~ s(pm25_2005 + pm25_rel_change_2005_2010), weights = weight,
+                 data = df)
+
+# Summarize model
+summary(gam_model)
+tidy(gam_model)
+
+# Visualize model
+plot(gam_model)
+plot(gam_model, pages = 1, shade = TRUE, shade.col = "red",
+     residuals = TRUE, pch = 16, cex = 0.1, scheme = 1, rug = TRUE)
+```
+
+### Plot scatterplots with smoothing splines
+
+```{r}
+# Visualize avg_effect and pm25_2005 with smoothing spline
+plot1 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_2005,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(aes(x = pm25_2005, y = avg_effect, group = 1),
+              method = "gam",
+              formula = y ~ s(x, bs = "cs"),
+              color = "black",
+              fill = "grey80",
+              linewidth = 1.1,
+              alpha = 0.2,
+              inherit.aes = FALSE) +
+  labs(x = "PM2.5 Concentration in 2005 (micrograms per cubic meter)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       title = "Starting PM2.5 Concentration and ATE on CO2 Emissions, 2005-2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8))
+plot1
+ggsave("plot1.png", plot = plot1)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010 with smoothing spline
+plot2 <- ggplot(df, aes(y = avg_effect,
+                        x = pm25_rel_change_2005_2010,
+                        color = factor(significance))) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(aes(x = pm25_rel_change_2005_2010, y = avg_effect, group = 1),
+              method = "gam",
+              formula = y ~ s(x, bs = "cs"),
+              color = "black",
+              fill = "grey80",
+              linewidth = 1.1,
+              alpha = 0.2,
+              inherit.aes = FALSE) + 
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       color = "Significance",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+
+# Visualize pm25_2005 and pm25_change_2005_2010
+ggplot(df, aes(y = pm25_2005, x = pm25_rel_change_2005_2010)) +
+  geom_point()
+```
+
+### Model and visualize with only counties that reduced PM2.5 from 2005 to 2010
+
+```{r}
+# Filter for counties that reduced PM2.5 from 2005 to 2010
+df_red <- df %>% 
+  filter(pm25_change_2005_2010 < 0) %>% 
+  mutate(weight = 1 / (sd_boot)^2)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010 with OLS model
+plot2 <- ggplot(df_red, aes(y = avg_effect,
+                            x = pm25_rel_change_2005_2010)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm") + 
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+
+# Fit model with OLS
+model_test_ols <- lm(avg_effect ~ pm25_rel_change_2005_2010, data = df_red)
+get_regression_table(model_test_ols)
+
+# Fit model with WLS
+model_test_wls <- lm(avg_effect ~ pm25_rel_change_2005_2010, weights = weight, data = df_red)
+get_regression_table(model_test_wls)
+
+# Fit two-predictor model with OLS
+model_test_two_ols <- lm(avg_effect ~ pm25_rel_change_2005_2010 + pm25_2005,
+                         data = df_red)
+get_regression_table(model_test_two_ols)
+
+# Fit two-predictor model with WLS
+model_test_two_wls <- lm(avg_effect ~ pm25_rel_change_2005_2010 + pm25_2005,
+                         weights = weight,
+                         data = df_red)
+get_regression_table(model_test_two_wls)
+```
+
+### Model and visualize with only significant counties that reduced PM2.5 from 2005 to 2010
+
+```{r}
+# Filter for significant counties that reduced PM2.5 from 2005 to 2010
+df_red_sig <- df %>% 
+  filter(pm25_change_2005_2010 < 0, significance == 1) %>% 
+  mutate(weight = 1 / (sd_boot)^2)
+
+# Visualize avg_effect and pm25_rel_change_2005_2010 with OLS model
+plot2 <- ggplot(df_red_sig, aes(y = avg_effect,
+                                x = pm25_rel_change_2005_2010)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  geom_smooth(method = "lm") + 
+  labs(x = "PM2.5 Relative Change from 2005 to 2010 (%)",
+       y = "Estimated ATE of NAAQS on CO2 Emissions (kilograms)",
+       title = "PM2.5 Change and ATE on CO2 Emissions, 2005-2010",
+       caption = "A positive x-value means PM2.5 increased from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        plot.caption = element_text(size = 8))
+plot2
+ggsave("plot2.png", plot = plot2)
+
+# Fit model with OLS
+model_test_ols <- lm(avg_effect ~ pm25_rel_change_2005_2010, data = df_red_sig)
+get_regression_table(model_test_ols)
+
+# Fit model with WLS
+model_test_wls <- lm(avg_effect ~ pm25_rel_change_2005_2010, weights = weight, data = df_red_sig)
+get_regression_table(model_test_wls)
+
+# Fit two-predictor model with OLS
+model_test_two_ols <- lm(avg_effect ~ pm25_rel_change_2005_2010 + pm25_2005,
+                         data = df_red_sig)
+get_regression_table(model_test_two_ols)
+
+# Fit two-predictor model with WLS
+model_test_two_wls <- lm(avg_effect ~ pm25_rel_change_2005_2010 + pm25_2005,
+                         weights = weight,
+                         data = df_red_sig)
+get_regression_table(model_test_two_wls)
+```

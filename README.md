@@ -2,9 +2,16 @@
 
 ## Overview
 
-This is the repository for a project estimating the causal effect of the EPA's National Ambient Air Quality Standards (NAAQS) for PM2.5 level on transporation-related CO2 emissions in U.S. The project applies `CausalArima` (Menchetti et al., 2021) on EIA data on total transportation-sector CO2 emissions in the U.S. (1960-2023) as well as aggregated NASA data on on-road CO2 emissions at the county level in the contiguous U.S. (1980-2017). The preliminary results look promising.
+This is the repository for a project estimating the causal effect of the EPA's National Ambient Air Quality Standards (NAAQS) for PM2.5 level in 2005 on transporation-related CO2 emissions in the U.S. 
+
+The preliminary analysis applies `CausalArima` (Menchetti et al., 2021) on EIA data on total transportation-sector CO2 emissions in the U.S. (1960-2023) and aggregated NASA data on on-road CO2 emissions at the county level in the contiguous U.S. (1980-2017).
+
+The current analysis is working to apply and extend spatial panel modeling via `splm` (Milo & Piras, 2012) on the county-level data.
 
 ## Repository Structure: Current Analysis
+
+- `data`:
+- `scripts`:
 
 ## Repository Structure: Preliminary Analysis
 

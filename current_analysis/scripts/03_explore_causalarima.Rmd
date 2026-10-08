@@ -1,0 +1,172 @@
+---
+title: "03: Explore CausalArima"
+author: "Ricky Truong"
+date: "Fall 2026"
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+  html_document:
+    df_print: paged
+geometry: margin=1in
+fontsize: 11pt
+---
+
+# Background
+
+### Delete everything in environment
+
+```{r, message = FALSE, warning = FALSE}
+rm(list = ls())
+```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(broom)
+library(CausalArima)
+library(colorspace)
+library(ggnewscale)
+library(ggpattern)
+library(glue)
+library(mgcv)
+library(moderndive)
+library(moments)
+library(npreg)
+library(plm)
+library(plotly)
+library(purrr)
+library(scales)
+library(scatterplot3d)
+library(sf)
+library(spdep)
+library(splm)
+library(tidyverse)
+library(tigris)
+library(tseries)
+```
+
+### Load data
+
+```{r}
+co2_county <- read_parquet("co2_county.parquet")
+df <- read_parquet("df.parquet")
+counties_sf <- st_read("counties_sf.gpkg")
+df_causal_arima <- read_csv("df_causal_arima.csv")
+```
+
+# Exploration with `CausalArima` library
+
+### Combine `df_wide` with `df_causal_arima` (both at county level)
+
+```{r}
+df_wide <- df_wide %>%
+  left_join(df_causal_arima %>% select(county,
+                                       avg_effect,
+                                       cum_effect,
+                                       rel_effect,
+                                       sd,
+                                       p_value),
+            by = "county")
+```
+
+### Add polygons to `df_wide`
+
+```{r}
+# Join df_wide with shapefile
+df_wide <- counties_sf %>% 
+  inner_join(df_wide, by = c("fips" = "county")) 
+```
+
+### Plot `co2_rel_change_perc`
+
+```{r}
+# Define diverging color palette
+div_colors <- c("#2166AC", "#4393C3", "#92C5DE", 
+                "#F7F7F7",
+                "#F4A582", "#D6604D", "#B2182B")
+
+# Compute global limits for co2_rel_change_perc
+global_min <- min(df_wide$co2_rel_change_perc, na.rm = TRUE)
+global_max <- max(df_wide$co2_rel_change_perc, na.rm = TRUE)
+
+# Create graph of differences
+change_map <- ggplot(data = df_wide) + 
+  geom_sf(aes(fill = co2_rel_change_perc), color = NA) +
+  scale_fill_gradientn(colors = div_colors,
+                       na.value = "white",
+                       limits = c(global_min, global_max),
+                       values = scales::rescale(c(global_min, 0, global_max)),
+                       labels = label_number(accuracy = 1),
+                       guide = guide_colorbar(barwidth = 20,
+                                              barheight = 1,
+                                              title.position = "top",
+                                              title.vjust = 1)) + 
+  labs(title = glue("Observed Change in CO2 Emissions by County, 2005-2010"),
+       fill = "Change in CO2 (%)") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE)
+
+# Plot and save graph
+change_map
+ggsave("change_map.png",
+       plot = change_map,
+       width = 8, height = 6, dpi = 300,
+       bg = "white")
+```
+
+### Plot `rel_effect_perc` and `pm25_rel_change_perc`
+
+```{r}
+# Create rel_effect_perc (i.e., rel_effect as a percentage)
+df_wide <- df_wide %>% 
+  mutate(rel_effect_perc = rel_effect * 100)
+
+# Plot scatterplot with OLS line
+scatterplot_ols <- ggplot(df_wide,
+                          aes(y = rel_effect_perc,
+                              x = pm25_rel_change_perc)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = TRUE, color = "#2166AC") +
+  geom_hline(yintercept = 0, color = "grey", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed") +
+  labs(x = "PM2.5 Rel. Change from 2005 to 2010 (%)",
+       y = "Estimated Rel. Effect of NAAQS on CO2 Emissions (%)",
+       title = "PM2.5 Change and Effect on CO2 Emissions, 2005-2010: OLS",
+       caption = "A negative x-value means PM2.5 decreased from 2005 to 2010 while
+                  a negative y-value means observed CO2 was overall less than
+                  counterfactual CO2 from 2005 to 2010") +
+  theme(plot.title = element_text(size = 12),
+        plot.caption = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.text = element_text(size = 8))
+
+# Plot and save graph
+scatterplot_ols
+ggsave("scatterplot_ols.png",
+       plot = scatterplot_ols,
+       width = 8, height = 6, dpi = 300,
+       bg = "white")
+```
+
+### Model `rel_effect` and `pm25_rel_change` via OLS
+
+```{r}
+# Fit linear regression model
+model_ols <- lm(rel_effect ~ pm25_rel_change, data = df_wide)
+get_regression_table(model_ols)
+```
+
+### Model `rel_effect` and `pm25_rel_change` via GAM
+
+```{r}
+# Fit generalized additive model
+model_gam <- gam(rel_effect ~ s(pm25_rel_change), data = df_wide)
+summary(model_gam)
+
+# Plot model
+plot(model_gam)
+```

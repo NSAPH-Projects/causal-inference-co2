@@ -1,0 +1,158 @@
+---
+title: "02: Run CausalArima"
+author: "Ricky Truong"
+date: "Fall 2026"
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+  html_document:
+    df_print: paged
+geometry: margin=1in
+fontsize: 11pt
+---
+
+# Background
+
+### Delete everything in environment
+
+```{r, message = FALSE, warning = FALSE}
+rm(list = ls())
+```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(broom)
+library(CausalArima)
+library(colorspace)
+library(ggnewscale)
+library(ggpattern)
+library(glue)
+library(mgcv)
+library(moderndive)
+library(moments)
+library(npreg)
+library(plm)
+library(plotly)
+library(purrr)
+library(scales)
+library(scatterplot3d)
+library(sf)
+library(spdep)
+library(splm)
+library(tidyverse)
+library(tigris)
+library(tseries)
+```
+
+### Load data
+
+```{r}
+co2_county <- read_parquet("co2_county.parquet")
+df <- read_parquet("df.parquet")
+counties_sf <- st_read("counties_sf.gpkg")
+```
+
+# Analysis with `CausalArima` library
+
+### Run `CausalArima()` on every available county to estimate statistics
+
+```{r, cache=TRUE}
+# Set seed
+set.seed(1)
+
+# Initialize list to store results
+results_list <- list()
+
+# Get unique counties to avoid repeating counties over years
+fips_vec <- unique(df_wide_filtered$county)
+
+# Loop through each county
+for (i in seq_along(fips_vec)) {
+
+  # Get county_df for current county
+  my_fips <- fips_vec[i]
+  county_df <- co2_county %>%
+    filter(county == my_fips)
+
+  # Filter for years less than or equal to 2010 (to avoid confounding)
+  county_df <- county_df %>%
+    filter(year <= 2010)
+
+  # Define intervention time point
+  intervention_date <- as.Date("2005-01-01")
+
+  # Create vector for dates
+  all_dates <- as.Date(paste0(county_df$year, "-01-01"))
+
+  # Create time series for outcome with yearly seasonality
+  y_ts <- ts(county_df$co2, frequency = 1)
+
+  # Use tryCatch to avoid full script crashing
+  tryCatch({
+
+    # Run CausalArima()
+    ce <- CausalArima(
+      y = y_ts,
+      dates = all_dates,
+      int.date = intervention_date,
+      nboot = 1000
+    )
+
+    # Get ARIMA model specification
+    arma <- ce$model$arma
+    ar_order <- arma[1]
+    ma_order <- arma[2]
+    differencing_order <- arma[6]
+
+    # Get impact as list
+    imp <- impact(ce)
+
+    # Extract statistics via impact_boot
+    boot_list <- imp$impact_boot
+    boot_effect <- boot_list$effect_cum[3, ]
+    avg_effect <- imp$impact_boot$average$estimates[3]
+    cum_effect <- imp$impact_boot$effect_cum$estimates[3]
+    rel_effect <- imp$impact_boot$effect_cum$estimates[4]
+    p_value_one_sided <- as.numeric(boot_list$p_values["p"])
+
+    # Store data as tibble
+    result_row <- tibble(
+      county = my_fips,
+      ar_order = ar_order,
+      differencing_order = differencing_order,
+      ma_order = ma_order,
+      avg_effect = avg_effect,
+      cum_effect = cum_effect,
+      rel_effect = rel_effect,
+      sd = boot_effect$sd,
+      ci_lower = boot_effect$inf,
+      ci_upper = boot_effect$sup,
+      p_value = min(1, 2 * p_value_one_sided)
+    )
+
+    # Add to current results
+    results_list[[length(results_list) + 1]] <- result_row
+
+    # Print progress
+    message(glue("{i}/{length(fips_vec)}: FIPS {my_fips} processed."))
+
+  }, error = function(e) {
+    warning(glue("Error for FIPS {my_fips}: {e$message}"))
+  })
+}
+
+# Save results
+df_causal_arima <- bind_rows(results_list)
+message("All counties processed. Final results saved.")
+```
+
+# Conclusion
+
+### Save results
+
+```{r}
+write_csv(df_causal_arima, "df_causal_arima.csv")
+```

@@ -1,0 +1,308 @@
+---
+title: "01: Prepare Data"
+author: "Ricky Truong"
+date: "Fall 2026"
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+  html_document:
+    df_print: paged
+geometry: margin=1in
+fontsize: 11pt
+---
+
+# Background
+
+### Delete everything in environment
+
+```{r, message = FALSE, warning = FALSE}
+rm(list = ls())
+```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(broom)
+library(CausalArima)
+library(colorspace)
+library(ggnewscale)
+library(ggpattern)
+library(glue)
+library(mgcv)
+library(moderndive)
+library(moments)
+library(npreg)
+library(plm)
+library(plotly)
+library(purrr)
+library(scales)
+library(scatterplot3d)
+library(sf)
+library(spdep)
+library(splm)
+library(tidyverse)
+library(tigris)
+library(tseries)
+```
+
+### Load data for county shapefile (from `library(tigris)`)
+
+```{r}
+# Load county shapefile (includes FIPS codes and geometry)
+counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>%
+  mutate(fips = paste0(STATEFP, COUNTYFP))
+
+# Filter for contiguous U.S.
+contiguous_fips <- setdiff(sprintf("%02d", 1:56),
+                           c("02", "15", "60", "66", "69", "72", "78"))
+counties_sf <- counties_sf %>%
+  filter(STATEFP %in% contiguous_fips)
+```
+
+### Load data for crosswalk (between ZCTA and county)
+
+```{r}
+xwalk22 <- read_parquet("us_xwalks__census__zcta2county_yearly__2022.parquet")
+xwalk21 <- read_parquet("us_xwalks__census__zcta2county_yearly__2021.parquet")
+xwalk20 <- read_parquet("us_xwalks__census__zcta2county_yearly__2020.parquet")
+xwalk19 <- read_parquet("us_xwalks__census__zcta2county_yearly__2019.parquet")
+xwalk18 <- read_parquet("us_xwalks__census__zcta2county_yearly__2018.parquet")
+xwalk17 <- read_parquet("us_xwalks__census__zcta2county_yearly__2017.parquet")
+xwalk16 <- read_parquet("us_xwalks__census__zcta2county_yearly__2016.parquet")
+xwalk15 <- read_parquet("us_xwalks__census__zcta2county_yearly__2015.parquet")
+xwalk14 <- read_parquet("us_xwalks__census__zcta2county_yearly__2014.parquet")
+xwalk13 <- read_parquet("us_xwalks__census__zcta2county_yearly__2013.parquet")
+xwalk12 <- read_parquet("us_xwalks__census__zcta2county_yearly__2012.parquet")
+xwalk11 <- read_parquet("us_xwalks__census__zcta2county_yearly__2011.parquet")
+xwalk10 <- read_parquet("us_xwalks__census__zcta2county_yearly__2010.parquet")
+xwalk09 <- read_parquet("us_xwalks__census__zcta2county_yearly__2009.parquet")
+xwalk08 <- read_parquet("us_xwalks__census__zcta2county_yearly__2008.parquet")
+xwalk07 <- read_parquet("us_xwalks__census__zcta2county_yearly__2007.parquet")
+xwalk06 <- read_parquet("us_xwalks__census__zcta2county_yearly__2006.parquet")
+xwalk05 <- read_parquet("us_xwalks__census__zcta2county_yearly__2005.parquet")
+xwalk04 <- read_parquet("us_xwalks__census__zcta2county_yearly__2004.parquet")
+xwalk03 <- read_parquet("us_xwalks__census__zcta2county_yearly__2003.parquet")
+xwalk02 <- read_parquet("us_xwalks__census__zcta2county_yearly__2002.parquet")
+xwalk01 <- read_parquet("us_xwalks__census__zcta2county_yearly__2001.parquet")
+xwalk00 <- read_parquet("us_xwalks__census__zcta2county_yearly__2000.parquet")
+```
+
+### Load data for total CO2 emissions (at census block group level in kilograms)
+
+```{r}
+# Create path to the .gdb directory
+co2_path <- "CMS_DARTE_V2_1735/data/DARTE_v2.gdb"
+
+# List the available layers (feature classes) inside the .gdb
+st_layers(dsn = co2_path)
+
+# Load the specific layer
+co2_cbg <- st_read(dsn = co2_path, layer = "DARTE_v2_blockgroup_kgco2_1980_2017")
+```
+
+### Load data for average PM2.5 concentration (at ZCTA level in micrograms per cubic meter)
+
+```{r}
+# Create path to the .parquet files
+pm25_path <- "dataverse_files"
+
+# List all .parquet files for years 2000–2020
+file_list <- list.files(path = pm25_path,
+                        pattern = "^pm25__ushap__zcta_yearly__20\\d{2}\\.parquet$",
+                        full.names = TRUE)
+
+# Read and combine all files into data frame
+pm25_zcta <- file_list %>%
+  lapply(read_parquet) %>%
+  bind_rows()
+```
+
+# Data wrangling for `co2_cbg`
+
+### Convert `co2_cbg` to tidy format
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  pivot_longer(cols = starts_with("kgco2_"),
+               names_to = "year",
+               names_prefix = "kgco2_",
+               values_to = "value") %>%
+  mutate(year = as.integer(year))
+```
+
+### Select for variables to avoid large data set
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  ungroup() %>%
+  st_drop_geometry() %>%
+  as.data.frame() %>%
+  rename(geoid = GEOID) %>%
+  select(geoid, year, value)
+```
+
+# Data wrangling for `xwalk`
+
+### Combine everything into one crosswalk
+
+```{r}
+years <- 2000:2022
+file_paths <- paste0("us_xwalks__census__zcta2county_yearly__", years, ".parquet")
+xwalk_list <- map(file_paths, read_parquet)
+xwalk <- bind_rows(xwalk_list)
+```
+
+# Aggregation for `pm25_zcta` (from ZCTA level to county level)
+
+### Join `xwalk` and `pm25_zcta`
+
+```{r}
+pm25_county <- inner_join(xwalk, pm25_zcta, by = c("zcta", "year"))
+```
+
+### Aggregate from ZCTA level to county level
+
+```{r}
+pm25_county <- pm25_county %>% 
+  group_by(year, county) %>% 
+  mutate(weight = (arealand_pct / 100)) %>% 
+  mutate(weight =  weight / sum(weight, na.rm = TRUE)) %>% 
+  summarize(pm25 = sum(PM25 * weight, na.rm = TRUE),
+            .groups = "drop")
+```
+
+# Aggregation for `co2_cbg` (from census block group level to county level)
+
+### Create variable for county FIPS code
+
+```{r}
+co2_cbg <- co2_cbg %>%
+  mutate(county = substring(geoid, 1, 5))
+```
+
+### Aggregate from census block group level to county level
+
+```{r}
+co2_county <- co2_cbg %>%
+  group_by(year, county) %>% 
+  summarize(co2 = sum(value, na.rm = TRUE),
+            .groups = "drop")
+```
+
+# Finalizing files (`df` has CO2 and PM2.5 at county level from 2000 to 2017)
+
+### Filter for contiguous U.S.
+
+```{r}
+pm25_county <- pm25_county %>% 
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+
+co2_county <- co2_county %>% 
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+```
+
+### Create `df` by joining `pm25_county` and `co2_county`
+
+```{r}
+df <- inner_join(pm25_county, co2_county, by = c("county", "year")) %>%
+  filter(substr(county, 1, 2) %in% contiguous_fips)
+```
+
+# Remove extreme counties (with CO2 2005-2010 relative changes above +/- 100%)
+
+### Create `df_wide` (in wide format) from `df` (in long/tidy format)
+
+```{r}
+df_wide <- df %>%
+  pivot_wider(names_from  = year,
+              values_from = c(co2, pm25))
+```
+
+### Calculate 2005-2010 change in CO2 and PM2.5 for each county
+
+```{r}
+df_wide <- df_wide %>%
+  mutate(co2_change = co2_2010 - co2_2005,
+         co2_rel_change = co2_change / co2_2005,
+         co2_rel_change_perc = co2_rel_change * 100,
+         pm25_change = pm25_2010 - pm25_2005,
+         pm25_rel_change = pm25_change / pm25_2005,
+         pm25_rel_change_perc = pm25_rel_change * 100)
+```
+
+### Create vector for counties with extreme values of `co2_rel_change_perc`
+
+```{r}
+# Filter for extreme counties
+extreme_counties <- df_wide %>% 
+  filter(abs(co2_rel_change_perc) >= 100)
+
+# Get vector of corresponding fips codes
+extreme_fips <- extreme_counties$county
+```
+
+### Filter `df_wide` and `co2_county` by removing extreme counties
+
+```{r}
+# Filter df_wide
+df_wide <- df_wide %>% 
+  filter(!(county %in% extreme_fips))
+
+# Filter co2_county
+co2_county <- co2_county %>% 
+  filter(!(county %in% extreme_fips))
+```
+
+# Data visualization
+
+### Aggregate CO2
+
+```{r}
+# Aggregate total CO2 for all counties by year
+co2_total_year <- co2_county %>%
+  group_by(year) %>%
+  summarize(total_co2 = sum(co2, na.rm = TRUE))
+
+# Check the result
+head(co2_total_year)
+```
+
+### Plot aggregate CO2
+
+```{r}
+# Create graph of CO2 data
+co2_plot <- co2_total_year %>%
+  ggplot() +
+  geom_line(aes(x = year, y = total_co2)) +
+  geom_vline(aes(xintercept = 2005, linetype = "2005: Nonattainment Designation from NAAQS"), 
+             color = "red") +
+  labs(title = "Aggregated On-Road CO2 Emissions in the Contiguous U.S.",
+       x = "Year",
+       y = "CO2 (kilograms)",
+       fill = "",
+       linetype = "") +
+  scale_linetype_manual(values = c("2005: Nonattainment Designation from NAAQS" = "dotted")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Plot and save graph
+co2_plot
+ggsave("co2_plot.png",
+       plot = co2_plot,
+       bg = "white")
+```
+
+# Conclusion
+
+### Save results
+
+```{r}
+# Save ordinary tabular datasets
+write_parquet(df, "df.parquet")
+write_parquet(co2_county, "co2_county.parquet")
+
+# Save spatial dataset
+st_write(counties_sf, "counties_sf.gpkg", delete_dsn = TRUE)
+```

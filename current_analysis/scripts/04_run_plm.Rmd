@@ -1,0 +1,584 @@
+---
+title: "04: Run plm"
+author: "Ricky Truong"
+date: "Fall 2026"
+output:
+  pdf_document:
+    fig_width: 5
+    fig_height: 4
+  html_document:
+    df_print: paged
+geometry: margin=1in
+fontsize: 11pt
+---
+
+# Background
+
+### Delete everything in environment
+
+```{r, message = FALSE, warning = FALSE}
+rm(list = ls())
+```
+
+### Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(arrow)
+library(broom)
+library(CausalArima)
+library(colorspace)
+library(ggnewscale)
+library(ggpattern)
+library(glue)
+library(mgcv)
+library(moderndive)
+library(moments)
+library(npreg)
+library(plm)
+library(plotly)
+library(purrr)
+library(scales)
+library(scatterplot3d)
+library(sf)
+library(spdep)
+library(splm)
+library(tidyverse)
+library(tigris)
+library(tseries)
+```
+
+### Load data
+
+```{r}
+co2_county <- read_parquet("co2_county.parquet")
+df <- read_parquet("df.parquet")
+counties_sf <- st_read("counties_sf.gpkg")
+```
+
+# Analysis with `plm` library
+
+### Prepare for `plm()` with `co2_county`
+
+```{r}
+# Rename variable to fips in co2_county
+co2_county <- co2_county %>%
+  rename(fips = county)
+
+# Filter for years less than or equal to 2004 (to fit to pre-treatment period)
+co2_county_2004 <- co2_county %>%
+  filter(year <= 2004)
+
+# Get shapefile of unique counties in co2_county_2004
+fips_panel <- sort(unique(co2_county_2004$fips))
+counties_sf <- counties(cb = TRUE, resolution = "20m", year = 2020) %>%
+  st_as_sf() %>%
+  mutate(fips = str_pad(paste0(STATEFP, COUNTYFP), 5, "left", "0")) %>%
+  filter(fips %in% fips_panel) %>%
+  st_make_valid()
+
+# Join co2_county_2004 with shapefile (to add polygons/geometry)
+co2_county_2004 <- counties_sf %>%
+  inner_join(co2_county_2004, by = c("fips" = "fips"))
+
+# Create neighbor list using KNN to ensure each county has 4 neighbors
+coords <- st_coordinates(st_centroid(counties_sf))
+nb_knn <- knn2nb(knearneigh(coords, k = 4))
+
+# Create listw object from nb_knn
+listw_object <- nb2listw(nb_knn, style = "W")
+
+# Ensure ordering matches plm()
+regions <- counties_sf$fips
+co2_county_2004 <- co2_county_2004 %>%
+  filter(fips %in% regions) %>%
+  mutate(fips = factor(fips, levels = regions)) %>%
+  arrange(fips, year)
+
+# Drop 1980 for every county (since there is no lag before)
+df_one <- co2_county_2004 %>%
+  arrange(fips, year) %>%
+  group_by(fips) %>%
+  mutate(
+    log_co2 = log(co2),
+    log_lag_co2 = log(lag(co2))
+  ) %>%
+  filter(!is.na(log_lag_co2)) %>%
+  ungroup()
+```
+
+### Run `plm()` with `df_one`: log-log model with 1 year of lag (i.e., most simple model)
+
+```{r}
+# Create panel dataframe from df_one
+pdf <- pdata.frame(df_one, index = c("fips", "year"))
+
+# Fit model
+model_1 <- plm(
+  log_co2 ~ log_lag_co2,
+  data = pdf,
+  model = "within",
+  effect = "individual"
+)
+summary(model_1)
+
+# Evaluate model with AIC
+log_lik_val <- as.numeric(model_1$logLik)
+k <- length(coef(model_1))
+AIC_val_1 <- -2 * log_lik_val + 2 * k
+AIC_val_1
+```
+
+This model is $\log(Y_{i, t}) = \beta_1 \log(y_{i, t - 1}) + \mu_{i} + \varepsilon_{i, t}$, which implies $\mathbb{E}[\log(Y_{i, t}) \mid \text{past}] = \beta_1 \log(y_{i, t - 1}) + \mu_{i}$. We estimate $\widehat{\mathbb{E}}[\log(Y_{i, t}) \mid \text{past}] = \hat{\beta}_1 \log(y_{i, t - 1}) + \hat{\mu}_{i}$. We thus want $\hat{\beta}_1$ (which we can extract from the model) and $\hat{\mu}_i$ (which we can calculate for each $i$).
+
+Let $y_{i} = \log(Y_{i, t})$ and $x_{i} = y_{i, t - 1}$. Our model is $y_{i} = \beta_1 x_{i} + \mu_{i} + \varepsilon_{i, t}$. Averaging over $t \in \{1, \ldots, T\}$, we have $\bar{y}_{i} = \beta_1 \bar{x}_{i} + \mu_{i} + \bar{\varepsilon}_{i, t}$. Since we assume $\mathbb{E}[\varepsilon_{i, t} \mid \text{past}] = 0$, for large $n$, $\bar{\varepsilon}_{i, t} \approx 0$, so $\bar{y}_{i} \approx \beta_1 \bar{x}_{i} + \mu_{i}$ $\implies$ $\mu_{i} \approx \bar{y}_{i} - \beta_1 \bar{x}_{i}$ $\implies$ $\hat{\mu}_{i} \approx \bar{y}_{i} - \hat{\beta}_{1} \bar{x}_{i}$.
+
+### Use `model_1` to estimate counterfactual CO2 values
+
+```{r}
+# Drop geometry
+df_one <- df_one %>%
+  sf::st_drop_geometry()
+
+# Get beta_1_hat
+beta_hat <- coef(model_1)
+beta_1_hat <- beta_hat["log_lag_co2"]
+
+# Get mu_i_hat for each county
+mu_hat_df <- df_one %>%
+  group_by(fips) %>%
+  summarize(
+    mu_hat = mean(log_co2 - beta_1_hat * log_lag_co2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Predict 2001 using observed 2000 CO2
+pred_2001 <- df_one %>%
+  filter(year == 2000) %>%
+  left_join(mu_hat_df, by = "fips") %>%
+  mutate(
+    pred_year = 2001,
+    pred_log_co2_2001 = beta_1_hat * log_co2 + mu_hat,
+    pred_co2_2001 = exp(pred_log_co2_2001)
+  ) %>%
+  select(
+    fips,
+    pred_year,
+    co2_2000 = co2,
+    log_co2_2000 = log_co2,
+    mu_hat,
+    pred_log_co2_2001,
+    pred_co2_2001
+  )
+
+# Display predicted vs. observed CO2 in 2001 for each county
+df_one %>% 
+  filter(year == 2001) %>% 
+  rename(co2_2001 = co2) %>% 
+  left_join(pred_2001, by = "fips") %>% 
+  select(fips, co2_2000, pred_co2_2001, co2_2001)
+```
+
+### Run `plm()` with `df_three`: log-log model with 3 years of lag (i.e., more complicated model)
+
+```{r}
+# Drop 1980, 1981, 1982 for every county (since we're using three years of lag)
+df_three <- co2_county_2004 %>%
+  arrange(fips, year) %>%
+  group_by(fips) %>%
+  mutate(
+    log_co2 = log(co2),
+    log_lag_co2_one = lag(log_co2, 1),
+    log_lag_co2_two = lag(log_co2, 2),
+    log_lag_co2_three = lag(log_co2, 3)
+  ) %>%
+  filter(
+    !is.na(log_lag_co2_one),
+    !is.na(log_lag_co2_two),
+    !is.na(log_lag_co2_three)
+  ) %>%
+  ungroup()
+
+# Create panel dataframe from df_three
+pdf <- pdata.frame(df_three, index = c("fips", "year"))
+
+# Fit model via plm()
+model_2 <- plm(
+  log_co2 ~ log_lag_co2_one + log_lag_co2_two + log_lag_co2_three,
+  data = pdf,
+  model = "within",
+  effect = "individual"
+)
+summary(model_2)
+```
+
+This model is $\log(Y_{i, t}) = \beta_1 \log(y_{i, t - 1}) + \beta_2 \log(y_{i, t - 2}) + \beta_3 \log(y_{i, t - 3}) + \mu_{i} + \varepsilon_{i, t}$, which implies $\mathbb{E}[\log(Y_{i, t}) \mid \text{past}] = \beta_1 \log(y_{i, t - 1}) + \beta_2 \log(y_{i, t - 2}) + \beta_3 \log(y_{i, t - 3}) + \mu_{i}$. We estimate $\widehat{\mathbb{E}}[\log(Y_{i, t}) \mid \text{past}] = \hat{\beta}_1 \log(y_{i, t - 1}) + \hat{\beta}_2 \log(y_{i, t - 2}) + \hat{\beta}_3 \log(y_{i, t - 3}) + \hat{\mu}_{i}$. We thus want $\hat{\beta}_1$, $\hat{\beta}_2$, and $\hat{\beta}_3$ (which we can extract from the model) and $\hat{\mu}_i$ (which we can calculate for each $i$).
+
+Let $y_{i, t} = \log(Y_{i, t})$ and $x_{i, t - j} = y_{i, t - j}$. Our model is $y_{i, t} = \beta_1 x_{i, t - 1} + \beta_2 x_{i, t - 2} + \beta_3 x_{i, t - 3} + \mu_{i} + \varepsilon_{i, t}$. Averaging over $t \in \{1, \ldots, T\}$, we have $\bar{y}_{i} = \beta_1 \bar{x}_{i - 1} + \beta_2 \bar{x}_{i - 2} + \beta_3 \bar{x}_{i - 3} + \mu_{i} + \bar{\varepsilon}_{i, t}$. Since we assume $\mathbb{E}[\varepsilon_{i, t} \mid \text{past}] = 0$, for large $n$, $\bar{\varepsilon}_{i, t} \approx 0$, so $\bar{y}_{i} \approx \beta_1 \bar{x}_{i - 1} + \beta_2 \bar{x}_{i - 2} + \beta_3 \bar{x}_{i - 3} + \mu_{i}$ $\implies$ $\mu_{i} \approx \bar{y}_{i} - \beta_1 \bar{x}_{i - 1} - \beta_2 \bar{x}_{i - 2} - \beta_3 \bar{x}_{i - 3}$ $\implies$ $\hat{\mu}_{i} \approx \bar{y}_{i} - \hat{\beta}_{1} \bar{x}_{i - 1} - \hat{\beta}_{2} \bar{x}_{i - 2} - \hat{\beta}_{3} \bar{x}_{i - 3}$.
+
+### Use `model_2` to estimate counterfactual CO2 values
+
+```{r}
+# Drop geometry
+df_clean <- df_three %>%
+  sf::st_drop_geometry()
+
+# Get beta estimates
+beta_hat <- coef(model_2)
+beta_1_hat <- beta_hat["log_lag_co2_one"]
+beta_2_hat <- beta_hat["log_lag_co2_two"]
+beta_3_hat <- beta_hat["log_lag_co2_three"]
+
+# Get mu_i_hat for each county
+mu_hat_df <- df_clean %>%
+  group_by(fips) %>%
+  summarize(
+    mu_hat = mean(
+      log_co2 -
+        beta_1_hat * log_lag_co2_one -
+        beta_2_hat * log_lag_co2_two -
+        beta_3_hat * log_lag_co2_three,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+# Prepare full county-year data without geometry
+df_all <- co2_county %>%
+  sf::st_drop_geometry() %>%
+  mutate(
+    fips = as.character(fips),
+    log_co2 = log(co2)
+  ) %>%
+  arrange(fips, year)
+
+# Create wide data with observed log CO2 values
+pred_wide <- df_all %>%
+  filter(year >= 2002, year <= 2010) %>%
+  select(fips, year, log_co2) %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = log_co2,
+    names_prefix = "log_co2_"
+  ) %>%
+  left_join(mu_hat_df, by = "fips")
+
+# For each year in 2005-2010, recursively predict log CO2
+for (yr in 2005:2010) {
+  
+  # Define lag column names
+  lag_1 <- paste0("log_co2_", yr - 1)
+  lag_2 <- paste0("log_co2_", yr - 2)
+  lag_3 <- paste0("log_co2_", yr - 3)
+  pred_col <- paste0("pred_log_co2_", yr)
+  
+  # Predict log CO2 for current year
+  pred_wide <- pred_wide %>%
+    mutate(
+      !!pred_col :=
+        beta_1_hat * .data[[lag_1]] +
+        beta_2_hat * .data[[lag_2]] +
+        beta_3_hat * .data[[lag_3]] +
+        mu_hat
+    )
+  
+  # Replace log_co2_yr with predicted value so future years use recursive predictions
+  pred_wide <- pred_wide %>%
+    mutate(
+      !!paste0("log_co2_", yr) := .data[[pred_col]]
+    )
+}
+
+# Convert predictions to long format
+pred_2005_2010 <- pred_wide %>%
+  select(fips, starts_with("pred_log_co2_")) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("pred_log_co2_"),
+    names_to = "pred_year",
+    values_to = "pred_log_co2"
+  ) %>%
+  mutate(
+    pred_year = as.numeric(stringr::str_remove(pred_year, "pred_log_co2_")),
+    pred_co2 = exp(pred_log_co2)
+  )
+
+# Join observed CO2 values for 2005-2010
+pred_vs_obs <- df_all %>%
+  filter(year >= 2005, year <= 2010) %>%
+  select(fips, year, observed_co2 = co2, observed_log_co2 = log_co2) %>%
+  left_join(
+    pred_2005_2010,
+    by = c("fips" = "fips", "year" = "pred_year")
+  )
+
+# Display predicted vs. observed CO2 in 2005-2010 for each county
+pred_vs_obs %>%
+  select(fips, year, observed_co2, pred_co2)
+```
+
+### Plot predicted vs. observed CO2 for individual county and for total (from `model_2`)
+
+```{r}
+# Plot for individual county
+pred_vs_obs %>% 
+  filter(fips == "01053") %>% 
+  ggplot(aes(x = year)) + 
+  geom_line(aes(y = observed_co2, color = "Observed CO2")) +
+  geom_line(aes(y = pred_co2, color = "Predicted CO2")) +
+  scale_color_manual(values = c("Observed CO2" = "blue", "Predicted CO2" = "red"))
+
+# Plot for total/aggregated
+pred_vs_obs %>% 
+  group_by(year) %>% 
+  summarize(total_observed_co2 = sum(observed_co2, na.rm = TRUE),
+            total_pred_co2 = sum(pred_co2, na.rm = TRUE)) %>% 
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = total_observed_co2, color = "Total Observed CO2")) +
+  geom_line(aes(y = total_pred_co2, color = "Total Predicted CO2")) +
+  scale_color_manual(values = c("Total Observed CO2" = "blue", "Total Predicted CO2" = "red"))
+```
+
+### Analyze Normality of residuals (from `model_2`) for one county 
+
+```{r}
+# Define function to get residuals for a county
+specified_fips <- "01053"
+get_county_residuals_three_lag <- function(
+    fips_use = specified_fips,
+    co2_train = co2_county_2004
+) {
+  
+  # Build 3-lag training data (pre-treatment only, up to 2004)
+  df_three <- co2_train %>%
+    sf::st_drop_geometry() %>%
+    mutate(
+      fips = as.character(fips),
+      log_co2 = log(co2)
+    ) %>%
+    arrange(fips, year) %>%
+    group_by(fips) %>%
+    mutate(
+      log_lag_co2_one = lag(log_co2, 1),
+      log_lag_co2_two = lag(log_co2, 2),
+      log_lag_co2_three = lag(log_co2, 3)
+    ) %>%
+    filter(
+      !is.na(log_lag_co2_one),
+      !is.na(log_lag_co2_two),
+      !is.na(log_lag_co2_three)
+    ) %>%
+    ungroup()
+  
+  # Convert to panel dataframe
+  pdf <- pdata.frame(df_three, index = c("fips", "year"))
+  
+  # Fit within / county fixed effects model
+  model_2 <- plm(
+    log_co2 ~ log_lag_co2_one + log_lag_co2_two + log_lag_co2_three,
+    data = pdf,
+    model = "within",
+    effect = "individual"
+  )
+  
+  # Extract beta estimates
+  beta_hat <- coef(model_2)
+  beta_1_hat <- beta_hat["log_lag_co2_one"]
+  beta_2_hat <- beta_hat["log_lag_co2_two"]
+  beta_3_hat <- beta_hat["log_lag_co2_three"]
+  
+  # Reconstruct county fixed effects mu_i
+  mu_hat_df <- df_three %>%
+    group_by(fips) %>%
+    summarize(
+      mu_hat = mean(
+        log_co2 -
+          beta_1_hat * log_lag_co2_one -
+          beta_2_hat * log_lag_co2_two -
+          beta_3_hat * log_lag_co2_three,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+  
+  # Get fitted values and residuals for county
+  county_resid_df <- df_three %>%
+    filter(fips == fips_use) %>%
+    left_join(mu_hat_df, by = "fips") %>%
+    mutate(
+      fitted_log_co2 =
+        beta_1_hat * log_lag_co2_one +
+        beta_2_hat * log_lag_co2_two +
+        beta_3_hat * log_lag_co2_three +
+        mu_hat,
+      
+      residual_log_co2 = log_co2 - fitted_log_co2,
+      
+      fitted_co2 = exp(fitted_log_co2),
+      residual_co2 = co2 - fitted_co2
+    ) %>%
+    select(
+      fips, year, co2, log_co2,
+      fitted_log_co2, residual_log_co2,
+      fitted_co2, residual_co2,
+      log_lag_co2_one, log_lag_co2_two, log_lag_co2_three,
+      mu_hat
+    )
+  
+  return(list(
+    model = model_2,
+    beta_hat = beta_hat,
+    mu_hat_df = mu_hat_df,
+    county_residuals = county_resid_df
+  ))
+}
+
+# Get residuals for fips 01053
+res_01053 <- get_county_residuals_three_lag(fips_use = "01053")
+
+# Summarize residuals
+res_01053$county_residuals
+summary(res_01053$model)
+
+# Plot histogram of residuals
+resid_01053 <- res_01053$county_residuals$residual_log_co2
+hist(resid_01053, breaks = 10, main = "Residuals for FIPS 01053",
+     xlab = "Log-scale residuals")
+
+# Plot Q-Q plot
+qqnorm(resid_01053)
+qqline(resid_01053)
+
+# Run Shapiro-Wilk test (high p indicates Normality)
+shapiro.test(resid_01053)
+
+# Plot observed and fitted values
+res_01053$county_residuals %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = fitted_log_co2, color = "Fitted log(CO2)"), linewidth = 1) +
+  geom_point(aes(y = log_co2, color = "Observed log(CO2)"), size = 2) +
+  labs(
+    title = "Observed vs. Fitted log(CO2) for FIPS 01053",
+    x = "Year",
+    y = "log(CO2)",
+    color = ""
+  ) +
+  theme_minimal()
+```
+
+### Analyze Normality of residuals (from `model_2`) for all counties
+
+```{r}
+# Run on all counties
+county_diag_df <- df_three %>%
+  group_split(fips) %>%
+  map_dfr(function(df_county) {
+    
+    # Get county residuals
+    county_res <- df_county %>%
+      left_join(mu_hat_df, by = "fips") %>%
+      mutate(
+        fitted =
+          beta_1_hat * log_lag_co2_one +
+          beta_2_hat * log_lag_co2_two +
+          beta_3_hat * log_lag_co2_three +
+          mu_hat,
+        
+        resid = log_co2 - fitted
+      )
+    
+    r <- county_res$resid
+    
+    tibble(
+      fips = unique(df_county$fips),
+      n = length(r),
+      mean_resid = mean(r),
+      sd_resid = sd(r),
+      skewness = moments::skewness(r),
+      kurtosis = moments::kurtosis(r),
+      shapiro_p = shapiro.test(r)$p.value,
+      jb_p = jarque.bera.test(r)$p.value,
+      acf1 = acf(r, plot = FALSE)$acf[2]
+    )
+  })
+
+# Plot histogram of p-values from Shapiro-Wilk test
+ggplot(county_diag_df, aes(x = shapiro_p)) +
+  geom_histogram(bins = 30) +
+  theme_minimal()
+
+# Get proportion of counties that have low p-value (non-Normality)
+mean(county_diag_df$shapiro_p < 0.01)
+
+# Display counties with low p-value (non-Normality)
+county_diag_df %>%
+  arrange(shapiro_p) %>%
+  slice(1:10)
+```
+
+### Analyze Normality of residuals (from `model_2`) for a "bad" county
+
+```{r}
+# Get fips and residuals of a county with low p-value (non-Normality)
+bad_fips <- county_diag_df %>%
+  arrange(shapiro_p) %>%
+  slice(1) %>%
+  pull(fips)
+bad_res <- get_county_residuals_three_lag(
+  fips_use = bad_fips
+)$county_residuals
+
+# Plot residuals over time
+ggplot(bad_res, aes(x = year, y = residual_log_co2)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = paste("Residual Time Series:", bad_fips),
+    x = "Year",
+    y = "Residual"
+  ) +
+  theme_minimal()
+
+# Plot histogram of residuals
+ggplot(bad_res, aes(x = residual_log_co2)) +
+  geom_histogram(bins = 10) +
+  labs(
+    title = paste("Residual Histogram:", bad_fips),
+    x = "Residual"
+  ) +
+  theme_minimal()
+
+# Plot Q-Q plot
+ggplot(bad_res, aes(sample = residual_log_co2)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(
+    title = paste("QQ Plot:", bad_fips)
+  ) +
+  theme_minimal()
+
+# Plot observed and fitted values
+res_29083 <- get_county_residuals_three_lag(fips_use = "29083")
+resid_29083 <- res_29083$county_residuals$residual_log_co2
+res_29083$county_residuals %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = fitted_log_co2, color = "Fitted log(CO2)"),
+            linewidth = 1) +
+  geom_point(aes(y = log_co2, color = "Observed log(CO2)"),
+             size = 2) +
+  labs(
+    title = "Observed vs. Fitted log(CO2) for FIPS 29083",
+    x = "Year",
+    y = "log(CO2)",
+    color = ""
+  ) +
+  theme_minimal()
+```
+
+# Conclusion
+
+### Save results
+
+```{r}
+write_csv(df_one, "df_one.csv")
+write_csv(df_three, "df_three.csv")
+```
